@@ -1,7 +1,7 @@
 /*
  * USB ethernet driver for USB2.0 to 100Mbps ethernet chip ch397.
  *
- * Copyright (C) 2023 Nanjing Qinheng Microelectronics Co., Ltd.
+ * Copyright (C) 2024 Nanjing Qinheng Microelectronics Co., Ltd.
  * Web: http://wch.cn
  * Author: WCH <tech@wch.cn>
  *
@@ -12,7 +12,10 @@
  *
  * Update Log:
  * V1.0 - initial version
- * V1.1 - support kernel 2.6.34 and above
+ * V1.1 - add support for kernel version beyond 2.6.33
+ * V1.2 - add usb packet protocol length judgment
+ *      - add support for VLAN network
+ *      - add support for ch396, ch339, ch336
  */
 
 #define DEBUG
@@ -36,10 +39,11 @@
 #include <linux/usb/usbnet.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/if_vlan.h>
 
 #define DRIVER_AUTHOR "WCH"
 #define DRIVER_DESC   "USB ethernet driver for ch397, etc."
-#define VERSION_DESC  "V1.1 On 2023.11"
+#define VERSION_DESC  "V1.2 On 2024.02"
 
 /* control requests */
 #define CH397_USB_GET_INFO 0x10
@@ -402,10 +406,7 @@ static int ch397_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 {
 	u32 size, header, offset = 0;
 	struct sk_buff *ch397_skb;
-
-#ifdef DEBUG_RX
-	printk(KERN_INFO "RX--SKB-LEN:%d", skb->len);
-#endif
+	struct ethhdr *ehdr;
 
 	if (unlikely(skb->len < CH397_RX_OVERHEAD)) {
 		dev_err(&dev->udev->dev, "unexpected tiny rx frame\n");
@@ -418,6 +419,28 @@ static int ch397_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		size = (header + 3) & 0xFFFC;
 		offset += CH397_RX_OVERHEAD;
 
+		if ((header < ETH_MIN_PACKET_SIZE) || (header > ETH_DEF_PACKET_SIZE + VLAN_HLEN)) {
+			netdev_err(dev->net, "%s : Bad Header Length: 0x%x\n", __func__, header);
+			return 0;
+		}
+
+		if ((size > ((ETH_DEF_PACKET_SIZE + VLAN_HLEN + 3) & 0xFFFC)) || (size + offset > skb->len)) {
+			netdev_err(dev->net, "%s : Bad RX Length: 0x%x\n", __func__, size);
+			return 0;
+		}
+
+		ehdr = (struct ethhdr *)(skb->data + offset);
+
+		if (unlikely(is_multicast_ether_addr(ehdr->h_dest))) {
+		} else if (unlikely(is_broadcast_ether_addr(ehdr->h_dest))) {
+		} else {
+			if (memcmp(ehdr->h_dest, dev->net->dev_addr, ETH_ALEN)) {
+				netdev_err(dev->net, "%s : Bad dest mac addr, dest[0x%p], dev[0x%p]\n", __func__,
+					   ehdr->h_dest, dev->net->dev_addr);
+				return 0;
+			}
+		}
+
 		ch397_skb = netdev_alloc_skb_ip_align(dev->net, size);
 		if (!ch397_skb)
 			return 0;
@@ -427,10 +450,6 @@ static int ch397_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 		usbnet_skb_return(dev, ch397_skb);
 
 		offset += size;
-
-#ifdef DEBUG_RX
-		printk("header: %d, size: %d, offset: %d\n", header, size, offset);
-#endif
 	}
 
 	if (skb->len != offset) {
@@ -445,15 +464,14 @@ static struct sk_buff *ch397_tx_fixup(struct usbnet *dev, struct sk_buff *skb, g
 {
 	int pad;
 	int len = skb->len;
+	struct ethhdr *eth = eth_hdr(skb);
 
-#ifdef DEBUG_TX
-	printk(KERN_INFO "TX0--SKB-LEN:%d", skb->len);
-#endif
-
-	len = min(len, ETH_DEF_PACKET_SIZE);
-	if (len < ETH_MIN_PACKET_SIZE) {
+	if (eth->h_proto == htons(ETH_P_8021Q))
+		len = min(len, ETH_DEF_PACKET_SIZE + VLAN_HLEN);
+	else
+		len = min(len, ETH_DEF_PACKET_SIZE);
+	if (len < ETH_MIN_PACKET_SIZE)
 		len = ETH_MIN_PACKET_SIZE;
-	}
 
 	len += CH397_TX_OVERHEAD;
 	len = (len + 3) & 0xFFFFFFFC;
@@ -465,10 +483,6 @@ static struct sk_buff *ch397_tx_fixup(struct usbnet *dev, struct sk_buff *skb, g
 	len -= CH397_TX_OVERHEAD;
 	pad = len - skb->len;
 
-#ifdef DEBUG_TX
-	printk("1---> skb->len: %d, len: %d, pad: %d\n", skb->len, len, pad);
-#endif
-
 	if (skb_headroom(skb) < CH397_TX_OVERHEAD || skb_tailroom(skb) < pad) {
 		struct sk_buff *skb2;
 
@@ -479,24 +493,16 @@ static struct sk_buff *ch397_tx_fixup(struct usbnet *dev, struct sk_buff *skb, g
 			return NULL;
 	}
 
-#ifdef DEBUG_TX
-	printk("1---> skb->len: %d, len: %d, pad: %d\n", skb->len, len, pad);
-#endif
-
 	__skb_push(skb, CH397_TX_OVERHEAD);
-
 	if (pad) {
 		memset(skb->data + skb->len, 0, pad);
 		__skb_put(skb, pad);
 	}
 
-#ifdef DEBUG_TX
-	printk("2---> skb->len: %d, len: %d, pad: %d\n", skb->len, len, pad);
-#endif
-
-	if (len > ETH_DEF_PACKET_SIZE)
-		len = ETH_DEF_PACKET_SIZE;
-
+	if (eth->h_proto == htons(ETH_P_8021Q))
+		len = min(len, ETH_DEF_PACKET_SIZE + VLAN_HLEN);
+	else
+		len = min(len, ETH_DEF_PACKET_SIZE);
 	skb->data[0] = len;
 	skb->data[1] = len >> 8;
 	skb->data[2] = len >> 16;
@@ -599,6 +605,35 @@ static const struct usb_device_id ch397_ids[] = {
 		.driver_info = (unsigned long)&ch397_info,
 	},
 
+	{
+		USB_DEVICE_INTERFACE_CLASS(0x1a86, 0x5396, USB_CLASS_VENDOR_SPEC), /* ch396 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
+
+	{
+		USB_DEVICE(0x1a86, 0x5396), /* ch396 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
+
+	{
+		USB_DEVICE_INTERFACE_CLASS(0x1a86, 0x5395, USB_CLASS_VENDOR_SPEC), /* ch339 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
+
+	{
+		USB_DEVICE(0x1a86, 0x5395), /* ch339 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
+
+	{
+		USB_DEVICE_INTERFACE_CLASS(0x1a86, 0x5394, USB_CLASS_VENDOR_SPEC), /* ch336 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
+
+	{
+		USB_DEVICE(0x1a86, 0x5394), /* ch336 chip */
+		.driver_info = (unsigned long)&ch397_info,
+	},
 
 	{},
 };
