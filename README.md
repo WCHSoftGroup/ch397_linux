@@ -5,7 +5,7 @@ USB2.0 to 100Mbps ethernet chip ch397 is fully compliant to the Communications D
 
 The CDC-ECM driver has limited capabilities to control specific devices. This generic driver does not have any knowledge about specific device protocols. Because of this, device manufacturers can create an alternate, or custom driver that is capable of accessing the device specific function sets.
 
-When use this vendor driver,  you needn't remove the cdc_ether driver cause this vendor driver supports automatic detection of chip mode and active switching.
+When use this vendor driver,  you needn't remove the cdc_ether driver cause this vendor driver supports automatic detection of chip mode and active switching in kernel version beyond 5.6.x, in lower versions, you need to actively uninstall the CDC-ECM driver. If you can modify the system kernel source code, you can add devices supported by the ch397 driver to the blacklist in cdc_ether.c file.
 
 This driver supports USB2.0 to 100Mbps ethernet chip ch397.
 
