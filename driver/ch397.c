@@ -508,7 +508,9 @@ static struct sk_buff *ch397_tx_fixup(struct usbnet *dev, struct sk_buff *skb, g
 	skb->data[2] = len >> 16;
 	skb->data[3] = len >> 24;
 
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(3, 18, 12))
 	usbnet_set_skb_tx_stats(skb, 1, 0);
+#endif
 
 	return skb;
 }
