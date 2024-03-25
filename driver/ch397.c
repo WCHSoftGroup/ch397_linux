@@ -16,6 +16,7 @@
  * V1.2 - add usb packet protocol length judgment
  *      - add support for VLAN network
  *      - add support for ch396, ch339, ch336
+ * V1.3 - add support for frame in multiple usb packets
  */
 
 #define DEBUG
@@ -23,12 +24,6 @@
 
 #undef DEBUG
 #undef VERBOSE
-
-#define DEBUG_TX
-#define DEBUG_RX
-
-#undef DEBUG_TX
-#undef DEBUG_RX
 
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -43,7 +38,7 @@
 
 #define DRIVER_AUTHOR "WCH"
 #define DRIVER_DESC   "USB ethernet driver for ch397, etc."
-#define VERSION_DESC  "V1.2 On 2024.02"
+#define VERSION_DESC  "V1.3 On 2024.03"
 
 /* control requests */
 #define CH397_USB_GET_INFO 0x10
@@ -64,7 +59,7 @@
 #define CH397_ETH_MAC_CFG 0x40000700
 #define CH397_ETH_MAC_H	  0x40000710
 #define CH397_ETH_MAC_L	  0x40000714
-#define CH397_ETH_BMSR	  0x40010740
+#define CH397_ETH_BMSR	  0x40000740
 
 #define CH397_LINK_STATUS (1 << 6)
 
@@ -86,6 +81,28 @@ struct ch397_int_data {
 	u8 status;
 	__le16 res3;
 } __packed;
+
+typedef enum {
+	STATE_S1 = 0,
+	STATE_S2,
+	STATE_S3,
+} StateType;
+
+struct ch397_rx_fixup_info {
+	struct sk_buff *ch397_skb;
+	u32 header;
+	u32 remaining;
+	u32 remaining_pad;
+	u32 size;
+	bool split_head;
+	u8 len[8];
+	u8 padlen;
+	StateType state;
+};
+
+struct ch397_common_private {
+	struct ch397_rx_fixup_info rx_fixup_info;
+};
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0))
 
@@ -204,7 +221,7 @@ static int ch397_read_shared_word(struct usbnet *dev, int phy, u8 reg, __le16 *v
 {
 	int err;
 
-	err = ch397_read(dev, CH397_USB_RD_PHY, CH397_ETH_BMSR + reg * 4, 2, value);
+	err = ch397_read(dev, CH397_USB_RD_PHY, CH397_ETH_BMSR | (reg << 16), 2, value);
 	if (err < 0) {
 		printk(KERN_ERR "Error getting link status.\n");
 		return err;
@@ -390,7 +407,10 @@ static int ch397_bind(struct usbnet *dev, struct usb_interface *intf)
 
 	dev->net->netdev_ops = &ch397_netdev_ops;
 	dev->net->ethtool_ops = &ch397_ethtool_ops;
-	dev->rx_urb_size = 4096 * 10;
+	dev->rx_urb_size = 1024 * 2;
+
+	dev->net->needed_headroom = 8;
+	dev->net->needed_tailroom = 4;
 
 	dev->mii.dev = dev->net;
 	dev->mii.mdio_read = ch397_mdio_read;
@@ -398,62 +418,166 @@ static int ch397_bind(struct usbnet *dev, struct usb_interface *intf)
 	dev->mii.phy_id_mask = 0x1f;
 	dev->mii.reg_num_mask = 0x1f;
 
+	dev->driver_priv = kzalloc(sizeof(struct ch397_common_private), GFP_KERNEL);
+	if (!dev->driver_priv)
+		return -ENOMEM;
+
 out:
 	return ret;
 }
 
+static void ch397_unbind(struct usbnet *dev, struct usb_interface *intf)
+{
+	kfree(dev->driver_priv);
+}
+
+static void reset_ch397_rx_fixup_info(struct ch397_rx_fixup_info *rx)
+{
+	/* Reset the variables that have a lifetime outside of
+	 * rx_fixup so that future processing starts from a
+	 * known set of initial conditions.
+	 */
+
+	if (rx->ch397_skb) {
+		/* Discard any incomplete Ethernet frame in the netdev buffer */
+		kfree_skb(rx->ch397_skb);
+		rx->ch397_skb = NULL;
+	}
+
+	/* Assume the Data header 32-bit word is at the start of the current
+	 * or next URB socket buffer so reset all the state variables.
+	 */
+	rx->remaining = 0;
+	rx->remaining_pad = 0;
+	rx->split_head = false;
+	rx->header = 0;
+	rx->size = 0;
+	rx->padlen = 0;
+}
+
 static int ch397_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 {
-	u32 size, header, offset = 0;
-	struct sk_buff *ch397_skb;
 	struct ethhdr *ehdr;
+	struct ch397_common_private *dp = dev->driver_priv;
+	struct ch397_rx_fixup_info *rx = &dp->rx_fixup_info;
+	u32 offset = 0;
+	u32 copy_length = 0;
 
 	if (unlikely(skb->len < CH397_RX_OVERHEAD)) {
-		dev_err(&dev->udev->dev, "unexpected tiny rx frame\n");
+		dev_err(&dev->udev->dev, "unexpected tiny rx frame, len: %d\n", skb->len);
 		return 0;
 	}
 
-	while ((offset + CH397_RX_OVERHEAD) < skb->len) {
-		header = get_unaligned_le32(skb->data + offset);
-		/* get the packet length */
-		size = (header + 3) & 0xFFFC;
-		offset += CH397_RX_OVERHEAD;
-
-		if ((header < ETH_MIN_PACKET_SIZE) || (header > ETH_DEF_PACKET_SIZE + VLAN_HLEN)) {
-			netdev_err(dev->net, "%s : Bad Header Length: 0x%x\n", __func__, header);
-			return 0;
+	if (rx->state == STATE_S2) {
+		u32 header;
+		if (rx->remaining_pad && (rx->remaining_pad + 4 <= skb->len)) {
+			offset = rx->remaining_pad;
+			header = get_unaligned_le32(skb->data + offset);
+			offset = 0;
+			if ((header < ETH_MIN_PACKET_SIZE) || (header > ETH_DEF_PACKET_SIZE + VLAN_HLEN)) {
+				netdev_err(dev->net, "%s : Bad Header Length in S2: 0x%x\n", __func__, header);
+				reset_ch397_rx_fixup_info(rx);
+			}
 		}
+	}
 
-		if ((size > ((ETH_DEF_PACKET_SIZE + VLAN_HLEN + 3) & 0xFFFC)) || (size + offset > skb->len)) {
-			netdev_err(dev->net, "%s : Bad RX Length: 0x%x\n", __func__, size);
-			return 0;
-		}
+	while ((offset + CH397_RX_OVERHEAD) <= skb->len) {
+		if (!rx->remaining) {
+			if ((skb->len - offset < CH397_RX_OVERHEAD) || rx->split_head) {
+				if (!rx->split_head) {
+					rx->padlen = CH397_RX_OVERHEAD - (skb->len - offset);
+					memcpy(rx->len, skb->data + offset, skb->len - offset);
+					rx->split_head = true;
+					offset = skb->len;
+					netdev_dbg(dev->net, "%s : ch397 fixup 1.\n", __func__);
+					break;
+				} else {
+					memcpy(rx->len + CH397_RX_OVERHEAD - rx->padlen, skb->data + offset,
+					       rx->padlen);
+					rx->header = get_unaligned_le32(rx->len);
+					rx->split_head = false;
+					offset += rx->padlen;
+					netdev_dbg(dev->net, "%s : ch397 fixup 2, rx->header: 0x%x\n", __func__,
+						   rx->header);
+				}
+			} else {
+				rx->header = get_unaligned_le32(skb->data + offset);
+				offset += CH397_RX_OVERHEAD;
+			}
 
-		ehdr = (struct ethhdr *)(skb->data + offset);
+			/* get the packet length */
+			rx->size = (rx->header + 3) & 0xFFFC;
 
-		if (unlikely(is_multicast_ether_addr(ehdr->h_dest))) {
-		} else if (unlikely(is_broadcast_ether_addr(ehdr->h_dest))) {
-		} else {
-			if (memcmp(ehdr->h_dest, dev->net->dev_addr, ETH_ALEN)) {
-				netdev_err(dev->net, "%s : Bad dest mac addr, dest[0x%p], dev[0x%p]\n", __func__,
-					   ehdr->h_dest, dev->net->dev_addr);
+			if ((rx->header < ETH_MIN_PACKET_SIZE) || (rx->header > ETH_DEF_PACKET_SIZE + VLAN_HLEN)) {
+				netdev_err(dev->net, "%s : Bad Header Length: 0x%x\n", __func__, rx->header);
+				reset_ch397_rx_fixup_info(rx);
 				return 0;
+			}
+
+			if (rx->size > ((ETH_DEF_PACKET_SIZE + VLAN_HLEN + 3) & 0xFFFC)) {
+				netdev_err(dev->net, "%s : Bad RX Length: 0x%x\n", __func__, rx->size);
+				reset_ch397_rx_fixup_info(rx);
+				return 0;
+			}
+
+			rx->ch397_skb = netdev_alloc_skb_ip_align(dev->net, rx->size);
+			if (!rx->ch397_skb)
+				return 0;
+
+			rx->remaining = rx->header;
+			rx->remaining_pad = rx->size;
+			rx->state = STATE_S1;
+		}
+
+		if (rx->state != STATE_S2) {
+			ehdr = (struct ethhdr *)(skb->data + offset);
+			if (unlikely(is_multicast_ether_addr(ehdr->h_dest))) {
+			} else if (unlikely(is_broadcast_ether_addr(ehdr->h_dest))) {
+			} else {
+				if (memcmp(ehdr->h_dest, dev->net->dev_addr, ETH_ALEN)) {
+					netdev_err(dev->net, "%s : Bad dest mac addr, dest[0x%p], dev[0x%p]\n",
+						   __func__, ehdr->h_dest, dev->net->dev_addr);
+					return 0;
+				}
 			}
 		}
 
-		ch397_skb = netdev_alloc_skb_ip_align(dev->net, size);
-		if (!ch397_skb)
-			return 0;
+		if (rx->remaining_pad > skb->len - offset) {
+			copy_length = skb->len - offset;
+			rx->remaining_pad -= copy_length;
+			rx->state = STATE_S2;
+			netdev_dbg(dev->net,
+				   "%s : ch397 part of frame, copy_length: %d, remain_pad: %d, rx->size: %d\n",
+				   __func__, copy_length, rx->remaining_pad, rx->size);
+		} else {
+			if (rx->state == STATE_S2) {
+				copy_length = rx->remaining_pad;
+				rx->state = STATE_S3;
+			} else
+				copy_length = rx->remaining;
+			rx->remaining = 0;
+		}
 
-		skb_put(ch397_skb, header);
-		memcpy(ch397_skb->data, skb->data + offset, header);
-		usbnet_skb_return(dev, ch397_skb);
+		if (rx->ch397_skb) {
+			skb_put(rx->ch397_skb, copy_length);
+			memcpy(rx->ch397_skb->data, skb->data + offset, copy_length);
+			if (rx->state != STATE_S2) {
+				usbnet_skb_return(dev, rx->ch397_skb);
+				rx->ch397_skb = NULL;
+			}
+		}
 
-		offset += size;
+		if (rx->state == STATE_S2)
+			offset += copy_length;
+		else if (rx->state == STATE_S1)
+			offset += rx->remaining_pad;
+		else
+			offset += copy_length;
 	}
 
 	if (skb->len != offset) {
 		netdev_err(dev->net, "%s : Bad SKB Length %d, offset: %d\n", __func__, skb->len, offset);
+		reset_ch397_rx_fixup_info(rx);
 		return 0;
 	}
 
@@ -560,7 +684,7 @@ static int ch397_link_reset(struct usbnet *dev)
 
 	err = ch397_write(dev, CH397_USB_WR_REG, CH397_ETH_MAC_CFG, 4, &value);
 	if (err < 0) {
-		netdev_err(dev->net, "Error getting mac configure value.\n");
+		netdev_err(dev->net, "Error setting mac configure value.\n");
 		return err;
 	}
 
@@ -573,14 +697,13 @@ static const struct driver_info ch397_info = {
 	.description = "WCH CH397 USB2.0 Ethernet",
 	.flags = FLAG_ETHER | FLAG_LINK_INTR | FLAG_MULTI_PACKET,
 	.bind = ch397_bind,
+	.unbind = ch397_unbind,
 	.rx_fixup = ch397_rx_fixup,
 	.tx_fixup = ch397_tx_fixup,
 	.status = ch397_status,
 	.link_reset = ch397_link_reset,
 	.reset = ch397_link_reset,
 };
-
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0))
 
 static int ch397_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
@@ -593,8 +716,6 @@ static int ch397_probe(struct usb_interface *intf, const struct usb_device_id *i
 
 	return usbnet_probe(intf, id);
 }
-
-#endif
 
 static const struct usb_device_id ch397_ids[] = {
 	{
@@ -645,81 +766,14 @@ MODULE_DEVICE_TABLE(usb, ch397_ids);
 static struct usb_driver ch397_driver = {
 	.name = "usb_ch397",
 	.id_table = ch397_ids,
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0))
 	.probe = ch397_probe,
-#else
-	.probe = usbnet_probe,
-#endif
 	.disconnect = usbnet_disconnect,
 	.suspend = usbnet_suspend,
 	.resume = usbnet_resume,
 	.disable_hub_initiated_lpm = 1,
 };
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0))
-
-static int ch397_cfgselector_probe(struct usb_device *udev)
-{
-	struct usb_host_config *c;
-	int i, num_configs;
-
-	/* Switch the device to vendor mode, if and only if the vendor mode
-	 * driver supports it.
-	 */
-
-	/* The vendor mode is not always config #1, so to find it out. */
-	c = udev->config;
-	num_configs = udev->descriptor.bNumConfigurations;
-	for (i = 0; i < num_configs; (i++, c++)) {
-		struct usb_interface_descriptor *desc = NULL;
-
-		if (!c->desc.bNumInterfaces)
-			continue;
-		desc = &c->intf_cache[0]->altsetting->desc;
-		if (desc->bInterfaceClass == USB_CLASS_VENDOR_SPEC)
-			break;
-	}
-
-	if (i == num_configs)
-		return -ENODEV;
-
-	if (usb_set_configuration(udev, c->desc.bConfigurationValue)) {
-		dev_err(&udev->dev, "Failed to set configuration %d\n", c->desc.bConfigurationValue);
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static struct usb_device_driver ch397_cfgselector_driver = {
-	.name = "usb_ch397_cfgselector",
-	.probe = ch397_cfgselector_probe,
-	.id_table = ch397_ids,
-	.generic_subclass = 1,
-	.supports_autosuspend = 1,
-};
-
-static int __init ch397_driver_init(void)
-{
-	int ret;
-
-	ret = usb_register_device_driver(&ch397_cfgselector_driver, THIS_MODULE);
-	if (ret)
-		return ret;
-	return usb_register(&ch397_driver);
-}
-
-static void __exit ch397_driver_exit(void)
-{
-	usb_deregister(&ch397_driver);
-	usb_deregister_device_driver(&ch397_cfgselector_driver);
-}
-
-fs_initcall(ch397_driver_init);
-module_exit(ch397_driver_exit);
-#else
 module_usb_driver(ch397_driver);
-#endif
 
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
